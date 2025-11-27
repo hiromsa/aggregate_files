@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from typing import List, Set, Optional
+import threading
+from datetime import datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,11 +27,18 @@ class FileAggregator:
         self.base_domain = None
         self.base_path = None
         
+        # 進捗表示用の変数
+        self.total_files = 0
+        self.processed_files = 0
+        self.start_time = None
+        self.current_file = ""
+        self.lock = threading.Lock()
+        
         # スキップするファイル/ディレクトリのリスト
         self.skip_patterns = [
-            r'bin$', r'obj$', r'\.git$', r'\.vs$', r'__pycache__$', 
-            r'node_modules$', r'\.exe$', r'\.dll$', r'\.pdb$', 
-            r'\.zip$', r'\.tar\.gz$', r'\.log$', r'\.jpg$', 
+            r'bin$', r'obj$', r'\.git$', r'\.vs$', r'__pycache__$',
+            r'node_modules$', r'\.exe$', r'\.dll$', r'\.pdb$',
+            r'\.zip$', r'\.tar\.gz$', r'\.log$', r'\.jpg$',
             r'\.jpeg$', r'\.png$', r'\.ico$', r'\.css$', r'\.js$'
         ]
         
@@ -94,12 +103,45 @@ class FileAggregator:
         except Exception as e:
             return f"[ERROR: Failed to extract Word content: {str(e)}]"
     
+    def update_progress(self):
+        """進捗状況を表示"""
+        with self.lock:
+            if self.total_files > 0:
+                progress_percent = (self.processed_files / self.total_files) * 100
+                elapsed = datetime.now() - self.start_time if self.start_time else timedelta(0)
+                
+                if self.processed_files > 0 and elapsed.total_seconds() > 0:
+                    # 処理速度（ファイル/秒）
+                    rate = self.processed_files / elapsed.total_seconds()
+                    # 残りファイル数
+                    remaining_files = self.total_files - self.processed_files
+                    # 残り時間予測（秒）
+                    remaining_seconds = remaining_files / rate if rate > 0 else 0
+                    # 予測完了時刻
+                    eta = datetime.now() + timedelta(seconds=remaining_seconds)
+                    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    eta_str = "計算中..."
+                
+                print(f"\r進捗: {progress_percent:.1f}% ({self.processed_files}/{self.total_files} ファイル) "
+                      f"現在処理中: {self.current_file} "
+                      f"完了予定時刻: {eta_str}", end="", flush=True)
+    
     def process_local_file(self, file_path: str, relative_path: str) -> str:
         """ローカルファイルを処理"""
+        with self.lock:
+            self.current_file = relative_path
+        
         if self.should_skip_file(relative_path):
+            with self.lock:
+                self.processed_files += 1
+                self.update_progress()
             return ""
         
         if self.is_unsupported_format(relative_path):
+            with self.lock:
+                self.processed_files += 1
+                self.update_progress()
             return f"# File: {relative_path}\n```text\n[WARNING: The file format ({Path(relative_path).suffix}) is not supported. Content was skipped.]\n```\n\n"
         
         ext = Path(relative_path).suffix.lower()
@@ -107,35 +149,51 @@ class FileAggregator:
         try:
             if ext == '.pdf':
                 content = self.extract_pdf_text(file_path)
-                return f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
             elif ext == '.xlsx':
                 content = self.extract_xlsx_text(file_path)
-                return f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
             elif ext == '.docx':
                 content = self.extract_docx_text(file_path)
-                return f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
             elif ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.xml', '.yaml', '.yml', '.csv', '.sql']:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-                return f"# File: {relative_path}\n```{ext[1:] if ext else 'text'}\n{content}\n```\n\n"
+                result = f"# File: {relative_path}\n```{ext[1:] if ext else 'text'}\n{content}\n```\n\n"
             else:
                 # テキストファイルとして読み込みを試みる
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-                return f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
         except Exception as e:
-            return f"# File: {relative_path}\n```text\n[ERROR: Failed to read file: {str(e)}]\n```\n\n"
+            result = f"# File: {relative_path}\n```text\n[ERROR: Failed to read file: {str(e)}]\n```\n\n"
+        
+        with self.lock:
+            self.processed_files += 1
+            self.update_progress()
+        
+        return result
     
     def process_local_directory(self, root_path: str) -> str:
         """ローカルディレクトリを再帰的に処理"""
         result = ""
         root_path = Path(root_path).resolve()
         
+        # まず全ファイル数をカウント
+        print("ファイル数をカウント中...")
+        self.total_files = sum(1 for file_path in root_path.rglob('*')
+                              if file_path.is_file() and not self.should_skip_file(str(file_path.relative_to(root_path))))
+        self.processed_files = 0
+        self.start_time = datetime.now()
+        
+        print(f"処理開始: 合計 {self.total_files} ファイル")
+        
         for file_path in root_path.rglob('*'):
             if file_path.is_file():
                 relative_path = file_path.relative_to(root_path)
                 result += self.process_local_file(str(file_path), str(relative_path))
         
+        print()  # 進捗表示の後に改行
         return result
     
     def is_same_domain(self, url: str) -> bool:
@@ -182,6 +240,11 @@ class FileAggregator:
         """Webページをクロールしてコンテンツを抽出"""
         if url in self.visited_urls:
             return ""
+        
+        with self.lock:
+            self.current_file = url
+            self.processed_files += 1
+            self.update_progress()
         
         self.visited_urls.add(url)
         
@@ -237,16 +300,27 @@ class FileAggregator:
         self.base_domain = parsed.netloc
         self.base_path = '/'.join(parsed.path.split('/')[:-1]) if '/' in parsed.path else '/'
         
+        # Webクロール用の初期化
+        self.total_files = 50  # 見積もり値（実際のページ数はクロール中に変動）
+        self.processed_files = 0
+        self.start_time = datetime.now()
+        
+        print(f"Webクロール開始: {start_url}")
+        
         session = requests.Session()
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
         
-        return self.crawl_web_page(start_url, session)
+        result = self.crawl_web_page(start_url, session)
+        
+        print()  # 進捗表示の後に改行
+        return result
     
     def aggregate(self):
         """メインの集約処理"""
         print(f"開始: {self.input_source}")
+        start_time = datetime.now()
         
         if self.is_web_url(self.input_source):
             content = self.process_web_source(self.input_source)
@@ -254,10 +328,14 @@ class FileAggregator:
             content = self.process_local_directory(self.input_source)
         
         # 出力ファイルに書き込み
+        print("出力ファイルを作成中...")
         with open(self.output_file, 'w', encoding='utf-8') as f:
             f.write(content)
         
-        print(f"完了: {self.output_file}")
+        end_time = datetime.now()
+        elapsed = end_time - start_time
+        print(f"\n完了: {self.output_file}")
+        print(f"総処理時間: {elapsed}")
 
 
 def main():

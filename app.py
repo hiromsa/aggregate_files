@@ -5,6 +5,7 @@ import streamlit as st
 import subprocess
 import sys
 import os
+import re
 from pathlib import Path
 
 
@@ -83,6 +84,9 @@ def main():
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # 進捗情報表示
+        progress_info = st.empty()
+        
         # ログ表示エリア
         log_container = st.container()
         
@@ -105,7 +109,7 @@ def main():
             
             progress_bar.progress(30)
             
-            # リアルタイムログ表示
+            # リアルタイムログ表示と進捗解析
             log_output = ""
             with log_container:
                 log_placeholder = st.empty()
@@ -113,6 +117,17 @@ def main():
                 for line in process.stdout:
                     log_output += line
                     log_placeholder.code(log_output, language="text")
+                    
+                    # 進捗情報を解析して表示
+                    if "進捗:" in line:
+                        # 進捗バーを更新
+                        progress_match = re.search(r'進捗: (\d+\.?\d*)%', line)
+                        if progress_match:
+                            progress_percent = float(progress_match.group(1)) / 100
+                            progress_bar.progress(progress_percent)
+                        
+                        # 進捗情報を表示
+                        progress_info.text(line.strip())
             
             # プロセス完了待機
             return_code = process.wait()
@@ -121,6 +136,7 @@ def main():
             if return_code == 0:
                 progress_bar.progress(100)
                 status_text.text("完了!")
+                progress_info.text("処理が正常に完了しました。")
                 st.success(f"集約処理が正常に完了しました。出力ファイル: {output_file}")
                 
                 # 出力ファイルへのリンク
