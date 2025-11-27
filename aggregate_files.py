@@ -8,9 +8,11 @@ import time
 import re
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Tuple
 import threading
 from datetime import datetime, timedelta
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
@@ -44,6 +46,9 @@ class FileAggregator:
         
         # 未対応のファイル形式
         self.unsupported_formats = {'.xls', '.doc'}
+        
+        # 並列処理用の設定
+        self.max_workers = min(multiprocessing.cpu_count(), 8)  # 最大8ワーカーに制限
     
     def is_web_url(self, source: str) -> bool:
         """入力ソースがWeb URLかどうかを判定"""
@@ -174,27 +179,149 @@ class FileAggregator:
         
         return result
     
-    def process_local_directory(self, root_path: str) -> str:
-        """ローカルディレクトリを再帰的に処理"""
-        result = ""
+    @staticmethod
+    def process_file_worker(args: Tuple[str, str, List[str], Set[str]]) -> Tuple[str, str]:
+        """ワーカープロセスでファイルを処理する静的メソッド"""
+        file_path, relative_path, skip_patterns, unsupported_formats = args
+        
+        # スキップパターンのチェック
+        for pattern in skip_patterns:
+            if re.search(pattern, relative_path, re.IGNORECASE):
+                return relative_path, ""
+        
+        # 未対応フォーマットのチェック
+        ext = Path(relative_path).suffix.lower()
+        if ext in unsupported_formats:
+            return relative_path, f"# File: {relative_path}\n```text\n[WARNING: The file format ({ext}) is not supported. Content was skipped.]\n```\n\n"
+        
+        # ファイル処理
+        try:
+            if ext == '.pdf':
+                # PDF処理
+                try:
+                    with pdfplumber.open(file_path) as pdf:
+                        text = ""
+                        for page in pdf.pages:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text += page_text + "\n"
+                        content = text
+                except Exception as e:
+                    content = f"[ERROR: Failed to extract PDF content: {str(e)}]"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+            elif ext == '.xlsx':
+                # Excel処理
+                try:
+                    workbook = openpyxl.load_workbook(file_path)
+                    text = ""
+                    for sheet_name in workbook.sheetnames:
+                        sheet = workbook[sheet_name]
+                        text += f"Sheet: {sheet_name}\n"
+                        for row in sheet.iter_rows(values_only=True):
+                            row_text = "\t".join([str(cell) if cell is not None else "" for cell in row])
+                            if row_text.strip():
+                                text += row_text + "\n"
+                        text += "\n"
+                    content = text
+                except Exception as e:
+                    content = f"[ERROR: Failed to extract Excel content: {str(e)}]"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+            elif ext == '.docx':
+                # Word処理
+                try:
+                    doc = docx.Document(file_path)
+                    text = ""
+                    for paragraph in doc.paragraphs:
+                        if paragraph.text.strip():
+                            text += paragraph.text + "\n"
+                    content = text
+                except Exception as e:
+                    content = f"[ERROR: Failed to extract Word content: {str(e)}]"
+                result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+            elif ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.xml', '.yaml', '.yml', '.csv', '.sql']:
+                # テキストファイル処理
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    result = f"# File: {relative_path}\n```{ext[1:] if ext else 'text'}\n{content}\n```\n\n"
+                except Exception as e:
+                    result = f"# File: {relative_path}\n```text\n[ERROR: Failed to read file: {str(e)}]\n```\n\n"
+            else:
+                # その他のファイル形式
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    result = f"# File: {relative_path}\n```text\n{content}\n```\n\n"
+                except Exception as e:
+                    result = f"# File: {relative_path}\n```text\n[ERROR: Failed to read file: {str(e)}]\n```\n\n"
+        except Exception as e:
+            result = f"# File: {relative_path}\n```text\n[ERROR: Failed to process file: {str(e)}]\n```\n\n"
+        
+        return relative_path, result
+    
+    def process_local_directory_parallel(self, root_path: str) -> str:
+        """ローカルディレクトリを並列処理"""
         root_path = Path(root_path).resolve()
         
         # まず全ファイル数をカウント
         print("ファイル数をカウント中...")
-        self.total_files = sum(1 for file_path in root_path.rglob('*')
-                              if file_path.is_file() and not self.should_skip_file(str(file_path.relative_to(root_path))))
+        all_files = [(str(file_path), str(file_path.relative_to(root_path)))
+                    for file_path in root_path.rglob('*')
+                    if file_path.is_file() and not self.should_skip_file(str(file_path.relative_to(root_path)))]
+        
+        self.total_files = len(all_files)
         self.processed_files = 0
         self.start_time = datetime.now()
         
-        print(f"処理開始: 合計 {self.total_files} ファイル")
+        print(f"並列処理開始: 合計 {self.total_files} ファイル（{self.max_workers} ワーカー）")
         
-        for file_path in root_path.rglob('*'):
-            if file_path.is_file():
-                relative_path = file_path.relative_to(root_path)
-                result += self.process_local_file(str(file_path), str(relative_path))
+        # 結果を格納する辞書（順序保持用）
+        results = {}
+        
+        # 並列処理の実行
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # ワーカーに渡す引数を準備
+            tasks = [(file_path, relative_path, self.skip_patterns, self.unsupported_formats)
+                    for file_path, relative_path in all_files]
+            
+            # タスクをサブミット
+            future_to_path = {executor.submit(self.process_file_worker, task): task[1] for task in tasks}
+            
+            # 完了したタスクから結果を収集
+            for future in as_completed(future_to_path):
+                relative_path = future_to_path[future]
+                try:
+                    path, result = future.result()
+                    results[path] = result
+                    
+                    # 進捗更新
+                    with self.lock:
+                        self.processed_files += 1
+                        self.current_file = relative_path
+                        self.update_progress()
+                except Exception as e:
+                    error_result = f"# File: {relative_path}\n```text\n[ERROR: Worker process failed: {str(e)}]\n```\n\n"
+                    results[relative_path] = error_result
+                    
+                    # 進捗更新
+                    with self.lock:
+                        self.processed_files += 1
+                        self.current_file = relative_path
+                        self.update_progress()
+        
+        # 結果を元の順序で結合
+        final_result = ""
+        for _, relative_path in all_files:
+            if relative_path in results:
+                final_result += results[relative_path]
         
         print()  # 進捗表示の後に改行
-        return result
+        return final_result
+    
+    def process_local_directory(self, root_path: str) -> str:
+        """ローカルディレクトリを再帰的に処理"""
+        # 並列処理を使用
+        return self.process_local_directory_parallel(root_path)
     
     def is_same_domain(self, url: str) -> bool:
         """URLが同じドメインか判定"""
@@ -339,6 +466,10 @@ class FileAggregator:
 
 
 def main():
+    # Windowsでの並列処理の問題を回避するための設定
+    if sys.platform == 'win32':
+        multiprocessing.freeze_support()
+    
     parser = argparse.ArgumentParser(description='ファイル情報集約ツール')
     parser.add_argument('input_source', help='集約するルートディレクトリまたは開始URL')
     parser.add_argument('output_file', help='出力ファイルのパス')
