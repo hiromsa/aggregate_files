@@ -1,0 +1,11 @@
+# GUI
+streamlit>=1.28.0
+
+# Web処理
+requests>=2.31.0
+BeautifulSoup4>=4.12.0
+
+# ファイル処理
+pdfplumber>=0.9.0
+openpyxl>=3.1.0
+python-docx>=0.8.11
